@@ -1,0 +1,64 @@
+# =========================
+# HemeDiscover Specific Data
+# =========================
+# Raw Protein Datasets
+data_fetch/heme_proteins/
+data_fetch/non_heme_proteins/
+
+# Application Temporary Workspace
+temp_data/
+
+# =========================
+# Python Backend
+# =========================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+Pipfile.lock
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# =========================
+# React / Node.js Frontend
+# =========================
+# Dependencies
+frontend/node_modules/
+node_modules/
+
+# Production builds
+frontend/dist/
+dist/
+dist-ssr/
+
+# Logs and Caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.eslintcache
+
+# =========================
+# OS & IDE Files
+# =========================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Other Editors
+.idea/
+*.swp
