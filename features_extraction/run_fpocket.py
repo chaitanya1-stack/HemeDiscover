@@ -2,6 +2,7 @@ import os
 import glob
 import subprocess
 import math
+import shutil  
 import numpy as np
 import pandas as pd
 import concurrent.futures
@@ -9,13 +10,44 @@ from functools import partial
 from tqdm import tqdm
 
 # Directories
-HOLO_DIR = "../data_fetch/heme_proteins"        # Original with HEM
-APO_DIR = "../data_fetch/heme_proteins_apo"     # Cleaned (No HEM)
+HOLO_DIR = "../data_fetch/heme_proteins"        
+APO_DIR = "../data_fetch/heme_proteins_apo"     
 NON_HEME_DIR = "../data_fetch/non_heme_proteins"
 OUTPUT_CSV = "labeled_pocket_features.csv"
 
-# CONSTANT: Max file size in bytes (2.5 MB). Skips massive viral capsids/ribosomes that freeze fpocket.
+# CONSTANT: Max file size in bytes (2.5 MB). Skips massive complexes that hang fpocket.
 MAX_FILE_SIZE_BYTES = 2.5 * 1024 * 1024 
+
+def create_clean_apo_pdb(input_pdb_path, output_pdb_path):
+    """
+    Strips HEME and crystallization artifacts, but safely preserves 
+    structural metals and covalently modified amino acids to prevent 
+    artificial backbone cavities.
+    """
+    # 1. Structural Metals (Including common oxidation states)
+    metals = ['ZN', 'MG', 'CA', 'MN', 'FE', 'FE2', 'FE3', 'CU', 'NI', 'CO', 'MO']
+    
+    # 2. Modified Amino Acids (Crucial to prevent broken protein chains)
+    mod_res = ['MSE', 'SEP', 'TPO', 'PTR', 'PCA', 'CME', 'CSX', 'CSO']
+    
+    # Combine into a fast lookup set
+    approved_hetatms = set(metals + mod_res)
+    
+    with open(input_pdb_path, 'r') as infile, open(output_pdb_path, 'w') as outfile:
+        for line in infile:
+            if line.startswith("ATOM"):
+                outfile.write(line)
+                
+            elif line.startswith("HETATM"):
+                # Defeat unpredictable PDB whitespace formatting by stripping
+                res_name = line[17:20].strip() 
+                
+                # Keep it if it's a structural metal or a modified amino acid
+                if res_name in approved_hetatms:
+                    outfile.write(line)
+                    
+            elif line.startswith("TER") or line.startswith("END"):
+                outfile.write(line)
 
 def get_hem_centroid(pdb_path):
     """Parses a PDB file to find HEM or HEC ligand centroid."""
@@ -38,20 +70,33 @@ def calculate_distance(p1, p2):
 
 def process_single_pdb(pdb_filename, apo_dir, holo_dir, is_positive_class):
     pdb_id = pdb_filename.split('.')[0]
-    apo_path = os.path.join(apo_dir, pdb_filename)
+    original_apo_path = os.path.join(apo_dir, pdb_filename)
     holo_path = os.path.join(holo_dir, pdb_filename)
     hem_centroid = get_hem_centroid(holo_path) if is_positive_class else None
-        
+    
+    # ---> 1. CLEAN THE PDB ON THE FLY <---
+    clean_apo_filename = f"{pdb_id}_clean.pdb"
+    clean_apo_path = os.path.join(apo_dir, clean_apo_filename)
+    
     try:
-        # Fallback 30-second timeout in case a structurally weird (but small) protein hangs
-        subprocess.run(['fpocket', '-f', apo_path], capture_output=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        return []
+        create_clean_apo_pdb(original_apo_path, clean_apo_path)
     except Exception:
         return []
+
+    try:
+        # ---> 2. RUN FPOCKET WITH COFACTOR-SIZE FILTER (-i 60) <---
+        subprocess.run(['fpocket', '-f', clean_apo_path, '-i', '60'], capture_output=True, timeout=30)
+    except Exception:
+        if os.path.exists(clean_apo_path): os.remove(clean_apo_path)
+        return []
     
-    info_file = os.path.join(apo_dir, f"{pdb_id}_out", f"{pdb_id}_info.txt")
+    # fpocket appends "_clean_out" to our generated filename
+    out_dir_path = os.path.join(apo_dir, f"{pdb_id}_clean_out")
+    info_file = os.path.join(out_dir_path, f"{pdb_id}_clean_info.txt")
+    
     if not os.path.exists(info_file): 
+        if os.path.exists(clean_apo_path): os.remove(clean_apo_path)
+        if os.path.exists(out_dir_path): shutil.rmtree(out_dir_path)
         return []
         
     with open(info_file, 'r') as f:
@@ -67,13 +112,16 @@ def process_single_pdb(pdb_filename, apo_dir, holo_dir, is_positive_class):
             if curr_pkt and len(curr_pkt) > 2:
                 protein_pockets.append(curr_pkt)
                 pockets_extracted += 1
-            if pockets_extracted >= 5: 
+            
+            # Extract up to 10 pockets for comprehensive machine learning decoy training
+            if pockets_extracted >= 10: 
                 break
             
             pocket_name = line.split(":")[0].strip()
             pocket_num = pocket_name.replace("Pocket", "").strip()
             
-            atm_file = os.path.join(apo_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_atm.pdb")
+            # Point to the on-the-fly clean output directory structures
+            atm_file = os.path.join(out_dir_path, "pockets", f"pocket{pocket_num}_atm.pdb")
             
             res_counts = {'HIS': 0, 'CYS': 0, 'MET': 0, 'TYR': 0, 'PHE': 0, 'TRP': 0, 'ARG': 0, 'LYS': 0}
             aliphatic_count = 0
@@ -119,7 +167,7 @@ def process_single_pdb(pdb_filename, apo_dir, holo_dir, is_positive_class):
                             if seq_dict[seq_nums[i]] == 'CYS' and seq_dict[seq_nums[i+4]] == 'HIS':
                                 has_cxxch_motif = 1
 
-            vert_file = os.path.join(apo_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_vert.pqr")
+            vert_file = os.path.join(out_dir_path, "pockets", f"pocket{pocket_num}_vert.pqr")
             px, py, pz = [], [], []
             pocket_flatness = 0.0
             
@@ -181,14 +229,32 @@ def process_single_pdb(pdb_filename, apo_dir, holo_dir, is_positive_class):
             x, y, z = pkt.get('center_of_mass_x'), pkt.get('center_of_mass_y'), pkt.get('center_of_mass_z')
             if x is not None and y is not None and z is not None:
                 dist = calculate_distance(hem_centroid, (x, y, z))
-                if dist < 12.0:
+                
+                # ---> THE FIX: WIDENED THRESHOLD TO 15.0 TO ACCOUNT FOR APO RELAXATION <---
+                if dist < 15.0:
                     score = float(pkt.get('score', 0))
                     volume = float(pkt.get('volume', 0))
                     comp = (score * 50) + (volume * 0.1) - (dist * 10)
                     if comp > best_comp:
                         best_comp, best_idx = comp, i
+                        
         if best_idx != -1: 
             protein_pockets[best_idx]['Target'] = 1
+            
+    # ---> 3. SELF-CLEANING DEVOPS PATTERN <---
+    # Forcefully deletes the bloated temporary folder structure
+    if os.path.exists(out_dir_path):
+        try:
+            shutil.rmtree(out_dir_path) 
+        except Exception:
+            pass
+            
+    # Deletes the temporary intermediate clean .pdb text file
+    if os.path.exists(clean_apo_path):
+        try:
+            os.remove(clean_apo_path) 
+        except Exception:
+            pass
             
     return protein_pockets
 
@@ -199,10 +265,12 @@ def process_and_save_streaming(apo_dir, holo_dir, is_positive_class, is_first_wr
     skipped_count = 0
     for f in all_files:
         filename = os.path.basename(f)
+        if "_clean" in filename:
+            continue
+            
         pdb_id = filename.split('.')[0]
         
         if pdb_id not in processed_pdbs:
-            # INSTANT SPEED UP: Skip massive files before they freeze the pipeline
             if os.path.getsize(f) < MAX_FILE_SIZE_BYTES:
                 pdb_files.append(filename)
             else:
@@ -215,7 +283,6 @@ def process_and_save_streaming(apo_dir, holo_dir, is_positive_class, is_first_wr
         print(f"\n  All valid files in '{apo_dir}' are already processed. Skipping!")
         return is_first_write, global_cols
 
-    # Dynamically scales to any user's machine (caps at 8 cores for RAM safety)
     safe_cores = min(8, max(1, os.cpu_count() - 1))
     print(f"\n Processing '{apo_dir}' ({len(pdb_files)} files) with {safe_cores} cores...")
     
@@ -267,6 +334,6 @@ if __name__ == '__main__':
 
     if os.path.exists(OUTPUT_CSV):
         final_df = pd.read_csv(OUTPUT_CSV)
-        print(f"\n->  Successfully finished! {len(final_df)} total pockets are in '{OUTPUT_CSV}'.")
+        print(f"\n-> Successfully finished! {len(final_df)} total pockets are in '{OUTPUT_CSV}'.")
         if 'Target' in final_df.columns:
             print(f"-> Total True Heme-Binding Pockets (Target=1): {final_df['Target'].sum()}")

@@ -6,16 +6,14 @@ def convert_pdb_to_pdbqt(pdb_id, pdb_path, workspace):
     pdbqt_path = os.path.join(workspace, f"{pdb_id}.pdbqt")
     
     if os.path.exists(pdbqt_path):
-        os.remove(pdbqt_path)
+        return pdbqt_path 
         
-   
     command = ["obabel", pdb_path, "-O", pdbqt_path, "-p", "7.4", "-xr"]
     result = subprocess.run(command, capture_output=True, text=True)
     
     if result.returncode != 0:
         raise RuntimeError(f"OpenBabel conversion failed: {result.stderr}")
         
-    # Strip unnecessary ligand flexibility tags from the receptor
     with open(pdbqt_path, 'r') as file:
         lines = file.readlines()
         
@@ -28,23 +26,26 @@ def convert_pdb_to_pdbqt(pdb_id, pdb_path, workspace):
             
     return pdbqt_path
 
-def setup_and_run_vina(pdb_id, best_pocket, workspace):
-    pdb_path = os.path.join(workspace, f"{pdb_id}.pdb")
+def setup_and_run_vina(pdb_id, pocket_data, workspace):
+    # Locate the raw pdb one directory up from the docked workspace
+    parent_dir = os.path.dirname(workspace)
+    pdb_path = os.path.join(parent_dir, "raw", f"{pdb_id}.pdb")
     ligand_file = os.path.abspath("HEME_ligand.pdbqt") 
     
-    config_file = os.path.join(workspace, f"{pdb_id}_vina_config.txt")
-    output_file = os.path.join(workspace, f"{pdb_id}_docking_results.pdbqt")
+    pocket_id = pocket_data.get('Pocket_ID', 'unknown_pocket')
+    config_file = os.path.join(workspace, f"{pdb_id}_{pocket_id}_vina_config.txt")
+    output_file = os.path.join(workspace, f"{pdb_id}_{pocket_id}_docking_results.pdbqt")
     
     receptor_file = convert_pdb_to_pdbqt(pdb_id, pdb_path, workspace)
     
-    center_x = best_pocket.get('center_of_mass_x', 0)
-    center_y = best_pocket.get('center_of_mass_y', 0)
-    center_z = best_pocket.get('center_of_mass_z', 0)
+    center_x = pocket_data.get('center_of_mass_x', 0)
+    center_y = pocket_data.get('center_of_mass_y', 0)
+    center_z = pocket_data.get('center_of_mass_z', 0)
     
     buffer = 12.0 
-    size_x = max(best_pocket.get('size_x', 15.0) + buffer, 30.0)
-    size_y = max(best_pocket.get('size_y', 15.0) + buffer, 30.0)
-    size_z = max(best_pocket.get('size_z', 15.0) + buffer, 30.0)
+    size_x = max(pocket_data.get('size_x', 15.0) + buffer, 30.0)
+    size_y = max(pocket_data.get('size_y', 15.0) + buffer, 30.0)
+    size_z = max(pocket_data.get('size_z', 15.0) + buffer, 30.0)
     
     config_content = f"""receptor = {receptor_file}
 ligand = {ligand_file}
@@ -62,24 +63,19 @@ exhaustiveness = 8
     with open(config_file, "w") as f:
         f.write(config_content)
         
-    
     command = ["vina", "--config", config_file, "--out", output_file]
     result = subprocess.run(command, capture_output=True, text=True)
     
     if result.returncode != 0:
-        raise RuntimeError(f"Vina Docking failed: {result.stderr}")
+        raise RuntimeError(f"Vina Docking failed on {pocket_id}: {result.stderr}")
         
-    
     best_score = None
-    
-   
     match = re.search(r'\s+1\s+([-+]\d+\.\d+)', result.stdout)
     if match:
         best_score = float(match.group(1))
         
-  
     return {
         "docked_file": output_file,
         "affinity_score": best_score,
-        "log": result.stdout # Optional: keep the log just in case
+        "log": result.stdout
     }

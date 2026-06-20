@@ -4,42 +4,49 @@ import requests
 import numpy as np
 import pandas as pd
 
+def clean_uploaded_pdb(input_path, output_path):
+    metals = {'ZN', 'MG', 'CA', 'MN', 'FE', 'FE2', 'FE3', 'CU', 'NI', 'CO', 'MO'}
+    mod_res = {'MSE', 'SEP', 'TPO', 'PTR', 'PCA', 'CME', 'CSX', 'CSO'}
+    approved_hetatms = metals | mod_res
+    
+    with open(input_path, 'r') as infile, open(output_path, 'w') as outfile:
+        for line in infile:
+            if line.startswith("ATOM"):
+                outfile.write(line)
+            elif line.startswith("HETATM"):
+                res_name = line[17:20].strip()
+                if res_name in approved_hetatms:
+                    outfile.write(line)
+            elif line.startswith("TER") or line.startswith("END"):
+                outfile.write(line)
+
 def download_user_pdb(pdb_id, output_dir="temp_data"): 
-    """Downloads the PDB file and removes HEM ligands before saving."""
     os.makedirs(output_dir, exist_ok=True)
     filename = os.path.join(output_dir, f"{pdb_id}.pdb") 
     
     if not os.path.exists(filename):
         url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         
         if response.status_code == 200:
-            raw_lines = response.text.split('\n')
-            cleaned_lines = []
-            
-            for line in raw_lines:
-                # Just remove HETATM lines that are specifically HEM
-                if line.startswith("HETATM") and "HEM" in line:
-                    continue 
-                
-                cleaned_lines.append(line)
-                    
-            # Save the CLEANED version to the workspace
-            with open(filename, "w") as f:
-                f.write('\n'.join(cleaned_lines))
+            raw_path = os.path.join(output_dir, f"{pdb_id}_raw.pdb")
+            with open(raw_path, "w") as f:
+                f.write(response.text)
+            clean_uploaded_pdb(raw_path, filename)
         else:
             raise FileNotFoundError(f"Could not download PDB {pdb_id}")
             
     return filename
-def run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir="temp_data"):
-    """Runs fpocket and extracts pockets, saving them to the isolated workspace."""
-    # Run fpocket. It automatically creates a folder named {pdb_id}_out in the same directory as the pdb_path
-    subprocess.run(['fpocket', '-f', pdb_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+def run_fpocket_and_extract(pdb_id, pdb_path, output_dir="temp_data"):
+    subprocess.run(['fpocket', '-f', pdb_path, '-i', '60', '-m', '3.0', '-n', '15'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
     
-    # Update paths to look inside the specific output_dir
-    info_file = os.path.join(output_dir, f"{pdb_id}_out", f"{pdb_id}_info.txt")
-    if not os.path.exists(info_file):
-        raise ValueError("fpocket failed to generate pockets.")
+    # fpocket creates the _out folder in the same directory as the input pdb_path
+    pdb_dir = os.path.dirname(pdb_path)
+    info_file = os.path.join(pdb_dir, f"{pdb_id}_out", f"{pdb_id}_info.txt")
+    
+    if not os.path.exists(info_file) or os.path.getsize(info_file) == 0:
+        return pd.DataFrame() 
         
     with open(info_file, 'r') as f:
         lines = f.readlines()
@@ -55,16 +62,15 @@ def run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir="temp_data"):
                 pockets.append(curr_pkt)
                 pockets_extracted += 1
             
-            # --- EXTRACT TOP 15 POCKETS ---
-            if pockets_extracted >= 50: 
+            if pockets_extracted >= 15: 
                 break
+           
+            
             
             pocket_name = line.split(":")[0].strip()
             pocket_num = pocket_name.replace("Pocket", "").strip()
             
-            # Update path for ATM file
-            atm_file = os.path.join(output_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_atm.pdb")
-            
+            atm_file = os.path.join(pdb_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_atm.pdb")
             res_counts = {'HIS': 0, 'CYS': 0, 'MET': 0, 'TYR': 0, 'PHE': 0, 'TRP': 0, 'ARG': 0, 'LYS': 0}
             aliphatic_count, aromatic_count = 0, 0
             has_cp_motif, has_cxxch_motif = 0, 0
@@ -99,8 +105,7 @@ def run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir="temp_data"):
                         if seq_nums[i+4] == seq_nums[i] + 4 and seq_dict[seq_nums[i]] == 'CYS' and seq_dict[seq_nums[i+4]] == 'HIS':
                             has_cxxch_motif = 1
 
-            # Update path for VERT file
-            vert_file = os.path.join(output_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_vert.pqr")
+            vert_file = os.path.join(pdb_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_vert.pqr")
             px, py, pz = [], [], []
             pocket_flatness = 0.0
             
@@ -144,6 +149,7 @@ def run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir="temp_data"):
         
         elif curr_pkt is not None and ":" in line:
             parts = line.split(":", 1)
+            # This dynamically captures 'volume', 'polar_sasa', 'druggability_score', etc.
             key_clean = parts[0].strip().lower().replace(' ', '_').replace('(', '').replace(')', '').replace('-', '_')
             if key_clean != "residues":
                 try: curr_pkt[key_clean] = float(parts[1].strip())
@@ -153,5 +159,6 @@ def run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir="temp_data"):
         pockets.append(curr_pkt)
             
     df = pd.DataFrame(pockets)
-    df.columns = df.columns.astype(str).str.replace(' ', '_').str.replace('(', '').str.replace(')', '').str.replace('-', '_').str.replace(':', '')
+    if not df.empty:
+        df.columns = df.columns.astype(str).str.replace(' ', '_').str.replace('(', '').str.replace(')', '').str.replace('-', '_').str.replace(':', '')
     return df

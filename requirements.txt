@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+requests
+numpy
+pandas
+lightgbm
+shap
+scipy
+matplotlib

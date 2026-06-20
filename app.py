@@ -2,9 +2,15 @@ import os
 import uuid
 import shutil
 import time
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+import json
+import asyncio
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import lightgbm as lgb
 import shap
 from scipy.special import expit
@@ -12,12 +18,28 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from extraction_engine import download_user_pdb, run_fpocket_and_extract_15
+from extraction_engine import download_user_pdb, clean_uploaded_pdb, run_fpocket_and_extract
 from docking_engine import setup_and_run_vina
 
 app = FastAPI()
 
-model = lgb.Booster(model_file='heme_binder_lightgbm.txt')
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://heme-discover.vercel.app", 
+        "https://heme-discover-chaitanyas-projects-e89ad165.vercel.app",             
+        
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],  
+    allow_headers=["*"],  
+)
+
+MODEL_PATH = 'heme_binder_lightgbm.txt'
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Critical Error: '{MODEL_PATH}' not found. Ensure model is uploaded.")
+
+model = lgb.Booster(model_file=MODEL_PATH)
 
 EXPECTED_FEATURES = [
     'count_HIS', 'count_CYS', 'count_MET', 'count_TYR', 'aliphatic_hydrophobic_count', 
@@ -30,11 +52,9 @@ EXPECTED_FEATURES = [
     'flexibility'
 ]
 
+executor = ThreadPoolExecutor(max_workers=2)
 
-
-# Added 'delay' parameter. Defaults to 120s (2 minutes)
 def cleanup_workspace(job_dir: str, delay: int = 120):
-    """Waits 'delay' seconds, then deletes the user's temporary folder."""
     time.sleep(delay) 
     if os.path.exists(job_dir):
         shutil.rmtree(job_dir)
@@ -42,8 +62,7 @@ def cleanup_workspace(job_dir: str, delay: int = 120):
 
 def calculate_etd(size_x, size_y, size_z):
     volume = size_x * size_y * size_z
-    etd_seconds = (volume / 15000) * 45
-    return int(etd_seconds + 10)
+    return int(((volume / 15000) * 45) + 10)
 
 def get_residues_in_pocket(job_dir, pdb_id, pocket_id):
     pocket_num = pocket_id.replace("Pocket", "").strip()
@@ -58,46 +77,69 @@ def get_residues_in_pocket(job_dir, pdb_id, pocket_id):
                     residues.add(f"{res_name}{res_seq}")
     return list(residues)
 
-# --- MODELS ---
-
-class PDBRequest(BaseModel):
-    pdb_id: str
-
 class DockingRequest(BaseModel):
     job_id: str
     pdb_id: str
-    pocket_data: dict
+    pockets_data: list[dict]
 
-# --- ENDPOINT 1: FAST ML PREDICTION ---
-
+# --- ENDPOINTS ---
 
 @app.post("/predict_heme_binding")
-def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
-    pdb_id = request.pdb_id.upper()
+async def predict_binding(
+    background_tasks: BackgroundTasks,
+    pdb_id: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None)
+):
+    if not pdb_id and not file:
+        raise HTTPException(status_code=400, detail="Must provide either a PDB ID or upload a PDB file.")
+
     job_id = str(uuid.uuid4())
     job_dir = f"temp_data/{job_id}"
     os.makedirs(f"{job_dir}/static", exist_ok=True)
+    os.makedirs(f"{job_dir}/raw", exist_ok=True)
+    os.makedirs(f"{job_dir}/docked", exist_ok=True)
     
     try:
-        pdb_path = download_user_pdb(pdb_id, output_dir=job_dir)
-        df_pockets = run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir=job_dir)
+        if file:
+            effective_pdb_id = file.filename.split('.')[0].upper()
+            raw_path = os.path.join(job_dir, f"{effective_pdb_id}_raw.pdb")
+            pdb_path = os.path.join(job_dir, "raw", f"{effective_pdb_id}.pdb")
+            
+            with open(raw_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+                
+            clean_uploaded_pdb(raw_path, pdb_path) 
+        else:
+            effective_pdb_id = pdb_id.upper()
+            pdb_path = download_user_pdb(effective_pdb_id, output_dir=os.path.join(job_dir, "raw"))
+
+        df_pockets = run_fpocket_and_extract(effective_pdb_id, pdb_path, output_dir=job_dir)
         
-        ml_features = df_pockets[EXPECTED_FEATURES].fillna(0)
-        raw_logits = model.predict(ml_features)
+        if df_pockets is None or df_pockets.empty:
+            shutil.rmtree(job_dir)
+            return {
+                "status": "Non-Binder",
+                "message": f"No structural cavities detected in {effective_pdb_id}. Likely a Non-Heme Binder."
+            }
+
+        ml_features = df_pockets.reindex(columns=EXPECTED_FEATURES, fill_value=0)
+        raw_logits = model.predict(ml_features, raw_score=True)
         df_pockets['Binding_Probability'] = expit(raw_logits)
         
-
         valid_pockets = df_pockets[df_pockets['Binding_Probability'] >= 0.35]
         
         if valid_pockets.empty:
             shutil.rmtree(job_dir)
             return {
                 "status": "Non-Binder",
-                "message": f"Scanned 15 pockets in {pdb_id}. None passed threshold. Likely a Non-Heme Binder."
+                "message": f"Scanned pockets in {effective_pdb_id}. None passed the 35% confidence threshold."
             }
             
-        best_pocket = valid_pockets.sort_values(by='Binding_Probability', ascending=False).iloc[0]
-        best_idx = best_pocket.name
+        top_3_pockets = valid_pockets.sort_values(by='Binding_Probability', ascending=False).head(3)
+        pockets_list = top_3_pockets.to_dict(orient='records')
+        
+        best_idx = top_3_pockets.index[0]
+        best_pocket = pockets_list[0]
         
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(ml_features)
@@ -108,7 +150,7 @@ def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
         plt.title(f"Why {best_pocket['Pocket_ID']} binds Heme")
         plt.tight_layout()
         
-        shap_image_filename = f"{pdb_id}_shap.png"
+        shap_image_filename = f"{effective_pdb_id}_shap.png"
         shap_image_path = os.path.join(job_dir, "static", shap_image_filename)
         plt.savefig(shap_image_path)
         plt.close()
@@ -116,32 +158,26 @@ def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
         feature_impacts = list(zip(EXPECTED_FEATURES, pocket_shap_values))
         feature_impacts.sort(key=lambda x: abs(x[1]), reverse=True)
         
-        explanation = f"Protein {pdb_id} is classified as a Heme-Binder. {best_pocket['Pocket_ID']} is the active site with {best_pocket['Binding_Probability']*100:.1f}% confidence.\n\n"
+        explanation = f"Top Active Site: {best_pocket['Pocket_ID']} with {best_pocket['Binding_Probability']*100:.1f}% confidence.\n\n"
         for feature, impact in feature_impacts[:4]:
             direction = "strongly supported" if impact > 0 else "reduced"
             explanation += f"- The measurement for '{feature}' {direction} binding probability.\n"
-
-        res_list = get_residues_in_pocket(job_dir, pdb_id, best_pocket['Pocket_ID'])
         
-        buffer = 10.0
-        sz_x = max(best_pocket.get('size_x', 15.0) + buffer, 25.0)
-        sz_y = max(best_pocket.get('size_y', 15.0) + buffer, 25.0)
-        sz_z = max(best_pocket.get('size_z', 15.0) + buffer, 25.0)
-        etd = calculate_etd(sz_x, sz_y, sz_z)
+        res_list = get_residues_in_pocket(job_dir, effective_pdb_id, best_pocket['Pocket_ID'])
+        total_etd = sum([calculate_etd(p.get('size_x', 15), p.get('size_y', 15), p.get('size_z', 15)) for p in pockets_list])
         
-        # SCHEDULED 10-MINUTE  CLEANUP (600 Seconds)
         background_tasks.add_task(cleanup_workspace, job_dir, 600)
             
         return {
             "status": "Binder",
             "job_id": job_id,
-            "protein_id": pdb_id,
-            "best_pocket": best_pocket.to_dict(),
-            "confidence": f"{best_pocket['Binding_Probability']*100:.1f}%",
+            "protein_id": effective_pdb_id,
+            "top_pockets": pockets_list, 
+            "top_pocket_confidence": f"{best_pocket['Binding_Probability']*100:.1f}%",
             "explanation": explanation,
             "shap_chart_url": f"/workspace/{job_id}/static/{shap_image_filename}",
             "residues_involved": res_list[:20],
-            "docking_etd_seconds": etd
+            "docking_etd_seconds": total_etd
         }
 
     except Exception as e:
@@ -149,43 +185,64 @@ def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-# --- ENDPOINT 2: RUN DOCKING ---
-
 @app.post("/run_docking")
-def run_docking(request: DockingRequest, background_tasks: BackgroundTasks):
+async def run_docking(request: DockingRequest):
     job_dir = f"temp_data/{request.job_id}"
+    docked_dir = os.path.join(job_dir, "docked")
+    os.makedirs(docked_dir, exist_ok=True)
     
     if not os.path.exists(job_dir):
         raise HTTPException(status_code=404, detail="Session expired or invalid Job ID.")
         
-    try:
-        # 1. Catch the dictionary returned by our new Vina function
-        vina_results = setup_and_run_vina(request.pdb_id, request.pocket_data, workspace=job_dir)
+    async def docking_stream():
+        # 1. Yield initial state sequence
+        yield json.dumps({"status": "Started", "message": "Initializing Monte Carlo simulations..."}) + "\n"
+        await asyncio.sleep(1.2)  # Short artificial pause to display structural setup state smoothly
         
-        # Schedule cleanup exactly 2 minutes (120 seconds) after docking finishes
-        background_tasks.add_task(cleanup_workspace, job_dir, 120)
+        best_score = float('inf')
+        best_result_url = None
         
-        # 2. Include the affinity_score in the JSON response to the frontend
-        return {
-            "status": "Docking Complete",
-            "docking_result_url": f"/workspace/{request.job_id}/result/{request.pdb_id}_docking_results.pdbqt",
-            "affinity_score": vina_results["affinity_score"] # <-- Frontend needs this!
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-# --- ENDPOINT 3: SERVE WORKSPACE FILES ---
+        # 2. Iterate and yield specific executing pockets sequentially
+        for i, pocket in enumerate(request.pockets_data):
+            pocket_id = pocket.get("Pocket_ID", f"Pocket_{i+1}")
+            yield json.dumps({"status": "Progress", "message": f"Docking on {pocket_id}..."}) + "\n"
+            
+            loop = asyncio.get_event_loop()
+            try:
+                vina_results = await loop.run_in_executor(
+                    executor, setup_and_run_vina, request.pdb_id, pocket, docked_dir
+                )
+                
+                score = vina_results.get("affinity_score")
+                if score is not None and score < best_score:
+                    best_score = score
+                    safe_filename = urllib.parse.quote(os.path.basename(vina_results['docked_file']))
+                    best_result_url = f"/workspace/{request.job_id}/docked/{safe_filename}"
+                    
+            except Exception as e:
+                yield json.dumps({"status": "Error", "message": f"Failed on {pocket_id}: {str(e)}"}) + "\n"
+                
+        # 3. Yield the final mathematical comparison message requested
+        yield json.dumps({"status": "Calculating", "message": "Calculating best result among them..."}) + "\n"
+        await asyncio.sleep(1.5)
+
+        # Trigger cleanup task loop execution window
+        loop = asyncio.get_event_loop()
+        loop.call_later(120, cleanup_workspace, job_dir)
+
+        yield json.dumps({
+            "status": "Complete", 
+            "message": "All docking completed.",
+            "best_affinity_score": best_score,
+            "best_docking_result_url": best_result_url
+        }) + "\n"
+
+    return StreamingResponse(docking_stream(), media_type="application/x-ndjson")
+
 
 @app.get("/workspace/{job_id}/{file_type}/{filename}")
 def get_workspace_file(job_id: str, file_type: str, filename: str):
-    """Securely serves files from the isolated user workspace."""
-    if file_type == "static":
-        file_path = f"temp_data/{job_id}/static/{filename}"
-    else:
-        # All other files (like PDBQT results) sit directly in the job_dir
-        file_path = f"temp_data/{job_id}/{filename}"
-        
+    file_path = f"temp_data/{job_id}/{file_type}/{filename}"
     if os.path.exists(file_path):
         return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="File not found or session expired.")
