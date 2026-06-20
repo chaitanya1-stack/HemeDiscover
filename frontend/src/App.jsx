@@ -10,6 +10,7 @@ export default function App() {
   const [prediction, setPrediction] = useState(null);
   const [isDocking, setIsDocking] = useState(false);
   const [dockingUrl, setDockingUrl] = useState(null);
+  const [affinityScore, setAffinityScore] = useState(null);
   const [showShap, setShowShap] = useState(false);
 
   const handlePredict = async (e) => {
@@ -17,6 +18,7 @@ export default function App() {
     if (!pdbId) return;
     
     setDockingUrl(null);
+    setAffinityScore(null);
     setIsDocking(false);
     setShowShap(false);
     setPrediction(null);
@@ -57,6 +59,7 @@ export default function App() {
       if (!res.ok) throw new Error(data.detail || 'Docking failed');
       
       setDockingUrl(data.docking_result_url);
+      setAffinityScore(data.affinity_score); 
     } catch (err) {
       alert(err.message);
     } finally {
@@ -69,6 +72,7 @@ export default function App() {
     setPdbId('');
     setPrediction(null);
     setDockingUrl(null);
+    setAffinityScore(null);
     setShowShap(false);
   };
 
@@ -109,7 +113,6 @@ export default function App() {
     );
   };
 
-  // Helper to render the 10 data points requested from the JSON
   const renderPocketStats = (pocket) => {
     const stats = [
       { label: "Volume", value: pocket.volume },
@@ -182,6 +185,7 @@ export default function App() {
             exit={{ opacity: 0 }}
             className="landing-container"
           >
+            <div className="spinner"></div>
             <h2 style={{ color: 'var(--text-muted)' }}>Extracting Features & Running LightGBM...</h2>
           </motion.div>
         )}
@@ -221,7 +225,6 @@ export default function App() {
 
                   {renderStructuredExplanation(prediction.explanation)}
                   
-                  {/* POCKET PARAMETERS GRID */}
                   <h4 style={{ textTransform: 'uppercase', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '0.75rem', fontWeight: '700', letterSpacing: '1px' }}>
                     Pocket Topology ({prediction.best_pocket.Pocket_ID})
                   </h4>
@@ -238,7 +241,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* DOWNLOAD ORIGINAL PDB BUTTON */}
                   <a 
                     href={`/workspace/${prediction.job_id}/pdb/${prediction.protein_id}.pdb`} 
                     download={`${prediction.protein_id}.pdb`}
@@ -263,7 +265,6 @@ export default function App() {
                             alt="SHAP Analysis" 
                             className="shap-image"
                           />
-                          {/* SHAP DOWNLOAD LINK */}
                           <a 
                             href={prediction.shap_chart_url} 
                             download={`${prediction.protein_id}_SHAP.png`}
@@ -289,7 +290,7 @@ export default function App() {
                 <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
                   {isDocking ? (
                     <div style={{ textAlign: 'center' }}>
-                      <div style={{ width: '3rem', height: '3rem', border: '4px solid var(--border-color)', borderTopColor: 'var(--accent-color)', borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 1.5rem auto' }}></div>
+                      <div className="spinner"></div>
                       <h3 style={{ color: 'var(--text-main)', fontSize: '1.5rem', marginBottom: '0.5rem' }}>
                         Running Monte Carlo Simulation...
                       </h3>
@@ -309,13 +310,21 @@ export default function App() {
               ) : (
                 <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
                   
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                    <div style={{ padding: '0.75rem 1.5rem', backgroundColor: 'var(--danger-bg)', color: 'var(--danger-text)', borderRadius: '8px', border: '1px solid #fca5a5' }}>
-                      <span style={{ fontWeight: '700', marginRight: '0.5rem' }}>Auto-Delete Timer:</span> 
-                      Server files will be wiped in 2 minutes.
+                  {/* CLEANED UP HEADER USING CSS CLASSES */}
+                  <div className="docking-header">
+                    <div className="badge-group">
+                      <div className="badge badge-success">
+                        <span>Affinity Score:</span> 
+                        <span>{affinityScore} kcal/mol</span>
+                      </div>
+
+                      <div className="badge badge-danger">
+                        <span>Auto-Delete Timer:</span> 
+                        Files wipe in 2 mins.
+                      </div>
                     </div>
-                    {/* DOCKING RESULT PDBQT DOWNLOAD */}
-                    <a href={dockingUrl} download className="btn-primary" style={{ padding: '0.75rem 1.5rem', backgroundColor: '#0f172a' }}>
+
+                    <a href={dockingUrl} download className="btn-primary" style={{ backgroundColor: '#0f172a' }}>
                       ↓ Download Result (.PDBQT)
                     </a>
                   </div>

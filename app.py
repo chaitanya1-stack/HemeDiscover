@@ -30,7 +30,7 @@ EXPECTED_FEATURES = [
     'flexibility'
 ]
 
-# --- HELPER FUNCTIONS ---
+
 
 # Added 'delay' parameter. Defaults to 120s (2 minutes)
 def cleanup_workspace(job_dir: str, delay: int = 120):
@@ -70,7 +70,7 @@ class DockingRequest(BaseModel):
 
 # --- ENDPOINT 1: FAST ML PREDICTION ---
 
-# Added 'background_tasks' to the function signature
+
 @app.post("/predict_heme_binding")
 def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
     pdb_id = request.pdb_id.upper()
@@ -86,8 +86,8 @@ def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
         raw_logits = model.predict(ml_features)
         df_pockets['Binding_Probability'] = expit(raw_logits)
         
-        # LOWERED THRESHOLD: Increased recall to catch Myoglobin (1MBN)
-        valid_pockets = df_pockets[df_pockets['Binding_Probability'] >= 0.20]
+
+        valid_pockets = df_pockets[df_pockets['Binding_Probability'] >= 0.35]
         
         if valid_pockets.empty:
             shutil.rmtree(job_dir)
@@ -129,7 +129,7 @@ def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
         sz_z = max(best_pocket.get('size_z', 15.0) + buffer, 25.0)
         etd = calculate_etd(sz_x, sz_y, sz_z)
         
-        # SCHEDULED 10-MINUTE ORPHAN CLEANUP (600 Seconds)
+        # SCHEDULED 10-MINUTE  CLEANUP (600 Seconds)
         background_tasks.add_task(cleanup_workspace, job_dir, 600)
             
         return {
@@ -148,6 +148,8 @@ def predict_binding(request: PDBRequest, background_tasks: BackgroundTasks):
         if os.path.exists(job_dir): shutil.rmtree(job_dir)
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
 # --- ENDPOINT 2: RUN DOCKING ---
 
 @app.post("/run_docking")
@@ -158,19 +160,21 @@ def run_docking(request: DockingRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Session expired or invalid Job ID.")
         
     try:
-        docking_file_path = setup_and_run_vina(request.pdb_id, request.pocket_data, workspace=job_dir)
+        # 1. Catch the dictionary returned by our new Vina function
+        vina_results = setup_and_run_vina(request.pdb_id, request.pocket_data, workspace=job_dir)
         
         # Schedule cleanup exactly 2 minutes (120 seconds) after docking finishes
         background_tasks.add_task(cleanup_workspace, job_dir, 120)
         
+        # 2. Include the affinity_score in the JSON response to the frontend
         return {
             "status": "Docking Complete",
-            "docking_result_url": f"/workspace/{request.job_id}/result/{request.pdb_id}_docking_results.pdbqt"
+            "docking_result_url": f"/workspace/{request.job_id}/result/{request.pdb_id}_docking_results.pdbqt",
+            "affinity_score": vina_results["affinity_score"] # <-- Frontend needs this!
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 # --- ENDPOINT 3: SERVE WORKSPACE FILES ---
 
 @app.get("/workspace/{job_id}/{file_type}/{filename}")

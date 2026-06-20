@@ -5,20 +5,32 @@ import numpy as np
 import pandas as pd
 
 def download_user_pdb(pdb_id, output_dir="temp_data"): 
-    """Downloads the PDB file requested by the user into the isolated workspace."""
+    """Downloads the PDB file and removes HEM ligands before saving."""
     os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"{pdb_id}.pdb") # <--- MUST SAY output_dir
+    filename = os.path.join(output_dir, f"{pdb_id}.pdb") 
     
     if not os.path.exists(filename):
         url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
         response = requests.get(url, timeout=10)
+        
         if response.status_code == 200:
+            raw_lines = response.text.split('\n')
+            cleaned_lines = []
+            
+            for line in raw_lines:
+                # Just remove HETATM lines that are specifically HEM
+                if line.startswith("HETATM") and "HEM" in line:
+                    continue 
+                
+                cleaned_lines.append(line)
+                    
+            # Save the CLEANED version to the workspace
             with open(filename, "w") as f:
-                f.write(response.text)
+                f.write('\n'.join(cleaned_lines))
         else:
             raise FileNotFoundError(f"Could not download PDB {pdb_id}")
+            
     return filename
-
 def run_fpocket_and_extract_15(pdb_id, pdb_path, output_dir="temp_data"):
     """Runs fpocket and extracts pockets, saving them to the isolated workspace."""
     # Run fpocket. It automatically creates a folder named {pdb_id}_out in the same directory as the pdb_path

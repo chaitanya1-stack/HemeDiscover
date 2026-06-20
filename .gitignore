@@ -4,6 +4,7 @@
 # Raw Protein Datasets
 data_fetch/heme_proteins/
 data_fetch/non_heme_proteins/
+data_fetch/heme_proteins_apo/
 
 # Application Temporary Workspace
 temp_data/

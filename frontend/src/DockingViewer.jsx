@@ -5,41 +5,44 @@ export default function DockingViewer({ pdbId, dockingUrl }) {
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
-    if (!dockingUrl) return;
+    if (!dockingUrl || !pdbId) return;
 
-    // 1. Check if 3Dmol is loaded. If not, dynamically inject it and wait.
     if (!window.$3Dmol) {
       console.log("Downloading 3Dmol.js library...");
       const script = document.createElement('script');
       script.src = "https://3Dmol.org/build/3Dmol-min.js";
       script.async = true;
-      script.onload = () => setIsReady(true); // Triggers the re-render once loaded
+      script.onload = () => setIsReady(true);
       document.body.appendChild(script);
       return;
     }
 
-    // 2. The main rendering function
     const render3D = async () => {
       try {
         console.log("Starting 3D render...");
-        
-        // Clear any old instances to prevent ghosting
         viewerRef.current.innerHTML = '';
         
         const viewer = window.$3Dmol.createViewer(viewerRef.current, { 
           backgroundColor: '#f8fafc' 
         });
 
-        // --- Fetch and Render Protein ---
-        console.log(`Fetching protein: ${pdbId}`);
+        // --- FETCH RAW DATA FROM RCSB ---
+        console.log(`Fetching protein from RCSB: ${pdbId}`);
         const proteinRes = await fetch(`https://files.rcsb.org/download/${pdbId}.pdb`);
         if (!proteinRes.ok) throw new Error("Could not download Protein from RCSB.");
-        const proteinData = await proteinRes.text();
-        
-        viewer.addModel(proteinData, 'pdb');
+        const rawPdbText = await proteinRes.text();
+
+        // --- FRONTEND APO-FICATION (Strict Training Parity) ---
+        const cleanedPdbText = rawPdbText.split('\n').filter(line => {
+            if (line.startsWith("HETATM") && line.includes("HEM")) {
+                return false; // Only drop HEM
+            }
+            return true; // Keep everything else
+        }).join('\n');
+
+        // Pass the CLEANED text string to 3Dmol
+        viewer.addModel(cleanedPdbText, 'pdb');
         viewer.setStyle({model: 0}, {cartoon: {color: 'spectrum'}});
-        
-        // Use VDW instead of SAS. It is 10x faster and won't crash your browser.
         viewer.addSurface(window.$3Dmol.SurfaceType.VDW, {opacity: 0.5, color: 'white'}, {model: 0});
 
         // --- Fetch and Render Ligand ---
@@ -49,7 +52,7 @@ export default function DockingViewer({ pdbId, dockingUrl }) {
         const ligandData = await ligandRes.text();
         
         viewer.addModelsAsFrames(ligandData, 'pdbqt');
-        viewer.setStyle({model: 1}, {stick: {colorscheme: 'cyanCarbon', radius: 0.2}});
+        viewer.setStyle({model: 1}, {stick: {colorscheme: 'greenCarbon', radius: 0.3}});
 
         viewer.zoomTo();
         viewer.render();
@@ -57,7 +60,6 @@ export default function DockingViewer({ pdbId, dockingUrl }) {
         
       } catch (error) {
         console.error("3D Viewer Error:", error);
-        // Show the error directly on the screen so you don't have to hunt for it
         if (viewerRef.current) {
           viewerRef.current.innerHTML = `
             <div style="display:flex; height:100%; align-items:center; justify-content:center; color:#991b1b; padding:2rem; text-align:center;">
@@ -69,7 +71,7 @@ export default function DockingViewer({ pdbId, dockingUrl }) {
     };
 
     render3D();
-  }, [pdbId, dockingUrl, isReady]); // isReady ensures it runs AGAIN after the script downloads
+  }, [pdbId, dockingUrl, isReady]);
 
   return (
     <div 

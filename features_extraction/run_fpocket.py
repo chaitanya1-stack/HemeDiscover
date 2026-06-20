@@ -9,9 +9,13 @@ from functools import partial
 from tqdm import tqdm
 
 # Directories
-HEME_DIR = "../data_fetch/heme_proteins"
+HOLO_DIR = "../data_fetch/heme_proteins"        # Original with HEM
+APO_DIR = "../data_fetch/heme_proteins_apo"     # Cleaned (No HEM)
 NON_HEME_DIR = "../data_fetch/non_heme_proteins"
 OUTPUT_CSV = "labeled_pocket_features.csv"
+
+# CONSTANT: Max file size in bytes (2.5 MB). Skips massive viral capsids/ribosomes that freeze fpocket.
+MAX_FILE_SIZE_BYTES = 2.5 * 1024 * 1024 
 
 def get_hem_centroid(pdb_path):
     """Parses a PDB file to find HEM or HEC ligand centroid."""
@@ -32,20 +36,22 @@ def get_hem_centroid(pdb_path):
 def calculate_distance(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)
 
-def process_single_pdb(pdb_path, data_dir, is_positive_class):
-    pdb_id = os.path.basename(pdb_path).split('.')[0]
-    hem_centroid = get_hem_centroid(pdb_path) if is_positive_class else None
+def process_single_pdb(pdb_filename, apo_dir, holo_dir, is_positive_class):
+    pdb_id = pdb_filename.split('.')[0]
+    apo_path = os.path.join(apo_dir, pdb_filename)
+    holo_path = os.path.join(holo_dir, pdb_filename)
+    hem_centroid = get_hem_centroid(holo_path) if is_positive_class else None
         
     try:
-        subprocess.run(['fpocket', '-f', pdb_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        # Fallback 30-second timeout in case a structurally weird (but small) protein hangs
+        subprocess.run(['fpocket', '-f', apo_path], capture_output=True, timeout=30)
     except subprocess.TimeoutExpired:
         return []
     except Exception:
         return []
     
-    info_file = os.path.join(data_dir, f"{pdb_id}_out", f"{pdb_id}_info.txt")
-    
-    if not os.path.exists(info_file):
+    info_file = os.path.join(apo_dir, f"{pdb_id}_out", f"{pdb_id}_info.txt")
+    if not os.path.exists(info_file): 
         return []
         
     with open(info_file, 'r') as f:
@@ -67,22 +73,17 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
             pocket_name = line.split(":")[0].strip()
             pocket_num = pocket_name.replace("Pocket", "").strip()
             
-            # ---------------------------------------------------------
-            # ADVANCED BIOLOGICAL FEATURE EXTRACTION (Based on Literature)
-            # ---------------------------------------------------------
-            atm_file = os.path.join(data_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_atm.pdb")
+            atm_file = os.path.join(apo_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_atm.pdb")
             
-            # Categories based on Rathod et al. & Seki et al.
             res_counts = {'HIS': 0, 'CYS': 0, 'MET': 0, 'TYR': 0, 'PHE': 0, 'TRP': 0, 'ARG': 0, 'LYS': 0}
             aliphatic_count = 0
             aromatic_count = 0
-            
             has_cp_motif = 0
             has_cxxch_motif = 0
             
             if os.path.exists(atm_file):
                 unique_residues = set()
-                sequence_map = {} # Maps chain_id -> {res_seq: res_name}
+                sequence_map = {}
                 
                 with open(atm_file, 'r') as f_atm:
                     for atm_line in f_atm:
@@ -99,7 +100,6 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
                                 sequence_map[chain_id] = {}
                             sequence_map[chain_id][res_seq] = res_name
 
-                # 1. Tally Specific Amino Acids
                 for res_name, _, _ in unique_residues:
                     if res_name in res_counts:
                         res_counts[res_name] += 1
@@ -108,22 +108,18 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
                     if res_name in ['PHE', 'TYR', 'TRP']:
                         aromatic_count += 1
                         
-                # 2. Sequential Motif Detection (CP and CXXCH)
                 for chain, seq_dict in sequence_map.items():
                     seq_nums = sorted(seq_dict.keys())
                     for i in range(len(seq_nums) - 1):
-                        # Check CP Motif (CYS followed immediately by PRO)
                         if seq_nums[i+1] == seq_nums[i] + 1:
                             if seq_dict[seq_nums[i]] == 'CYS' and seq_dict[seq_nums[i+1]] == 'PRO':
                                 has_cp_motif = 1
                     for i in range(len(seq_nums) - 4):
-                        # Check CXXCH Motif
                         if seq_nums[i+4] == seq_nums[i] + 4:
                             if seq_dict[seq_nums[i]] == 'CYS' and seq_dict[seq_nums[i+4]] == 'HIS':
                                 has_cxxch_motif = 1
 
-            # 3. Spatial Geometry & Asymmetry (PCA of Alpha Spheres)
-            vert_file = os.path.join(data_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_vert.pqr")
+            vert_file = os.path.join(apo_dir, f"{pdb_id}_out", "pockets", f"pocket{pocket_num}_vert.pqr")
             px, py, pz = [], [], []
             pocket_flatness = 0.0
             
@@ -137,19 +133,16 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
                                 pz.append(float(vert_line[46:54].strip()))
                             except ValueError: pass
                 
-                # Calculate Covariance Matrix to find 3D principal axes
                 if len(px) >= 3:
                     coords = np.vstack((px, py, pz)).T
                     cov_mat = np.cov(coords, rowvar=False)
                     try:
                         eigenvalues, _ = np.linalg.eigh(cov_mat)
-                        eigenvalues = np.sort(eigenvalues)[::-1] # Sort descending
-                        # Flatness Index: (Length * Width) / Depth^2
+                        eigenvalues = np.sort(eigenvalues)[::-1]
                         if eigenvalues[2] > 0.001:
                             pocket_flatness = (eigenvalues[0] * eigenvalues[1]) / (eigenvalues[2] ** 2)
                     except Exception: pass
 
-            # Compile all features
             curr_pkt = {
                 'PDB_ID': pdb_id, 
                 'Pocket_ID': pocket_name, 
@@ -182,9 +175,6 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
     if curr_pkt and len(curr_pkt) > 2 and pockets_extracted < 10:
         protein_pockets.append(curr_pkt)
 
-    # ---------------------------------------------------------
-    # SMART TARGET LABELING (Distance + Geometry)
-    # ---------------------------------------------------------
     if is_positive_class and hem_centroid and protein_pockets:
         best_idx, best_comp = -1, -float('inf')
         for i, pkt in enumerate(protein_pockets):
@@ -194,7 +184,6 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
                 if dist < 12.0:
                     score = float(pkt.get('score', 0))
                     volume = float(pkt.get('volume', 0))
-                    # Composite score favors high fpocket score, large volume, and close distance
                     comp = (score * 50) + (volume * 0.1) - (dist * 10)
                     if comp > best_comp:
                         best_comp, best_idx = comp, i
@@ -203,15 +192,34 @@ def process_single_pdb(pdb_path, data_dir, is_positive_class):
             
     return protein_pockets
 
-def process_and_save_streaming(data_dir, is_positive_class, is_first_write, global_cols):
-    pdb_files = glob.glob(os.path.join(data_dir, "*.pdb"))
+def process_and_save_streaming(apo_dir, holo_dir, is_positive_class, is_first_write, global_cols, processed_pdbs):
+    all_files = glob.glob(os.path.join(apo_dir, "*.pdb"))
+    
+    pdb_files = []
+    skipped_count = 0
+    for f in all_files:
+        filename = os.path.basename(f)
+        pdb_id = filename.split('.')[0]
+        
+        if pdb_id not in processed_pdbs:
+            # INSTANT SPEED UP: Skip massive files before they freeze the pipeline
+            if os.path.getsize(f) < MAX_FILE_SIZE_BYTES:
+                pdb_files.append(filename)
+            else:
+                skipped_count += 1
+
+    if skipped_count > 0:
+        print(f" Auto-skipped {skipped_count} overly massive PDB complexes to save time.")
+
     if not pdb_files:
+        print(f"\n  All valid files in '{apo_dir}' are already processed. Skipping!")
         return is_first_write, global_cols
 
-    safe_cores = max(1, os.cpu_count() - 2)
-    print(f"\nProcessing '{data_dir}' (Parallel + Live Saving) with {safe_cores} cores...")
+    # Dynamically scales to any user's machine (caps at 8 cores for RAM safety)
+    safe_cores = min(8, max(1, os.cpu_count() - 1))
+    print(f"\n Processing '{apo_dir}' ({len(pdb_files)} files) with {safe_cores} cores...")
     
-    worker_func = partial(process_single_pdb, data_dir=data_dir, is_positive_class=is_positive_class)
+    worker_func = partial(process_single_pdb, apo_dir=apo_dir, holo_dir=holo_dir, is_positive_class=is_positive_class)
     
     with concurrent.futures.ProcessPoolExecutor(max_workers=safe_cores) as executor:
         futures = {executor.submit(worker_func, pdb): pdb for pdb in pdb_files}
@@ -234,17 +242,31 @@ def process_and_save_streaming(data_dir, is_positive_class, is_first_write, glob
     return is_first_write, global_cols
 
 if __name__ == '__main__':
-    if os.path.exists(OUTPUT_CSV):
-        os.remove(OUTPUT_CSV)
-        
+    processed_pdbs = set()
     first_write = True
     global_columns = None
     
-    first_write, global_columns = process_and_save_streaming(HEME_DIR, True, first_write, global_columns)
-    first_write, global_columns = process_and_save_streaming(NON_HEME_DIR, False, first_write, global_columns)
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            existing_df = pd.read_csv(OUTPUT_CSV, usecols=['PDB_ID'])
+            processed_pdbs = set(existing_df['PDB_ID'].astype(str).unique())
+            first_write = False
+            
+            global_columns = pd.read_csv(OUTPUT_CSV, nrows=0).columns
+            print(f"Found {len(processed_pdbs)} proteins already saved in {OUTPUT_CSV}. Resuming...")
+        except Exception as e:
+            print(f"Warning: Could not read existing CSV ({e}). Starting fresh.")
+            first_write = True
+            global_columns = None
+
+    # Step 1: Process Heme-binding proteins (Positives)
+    first_write, global_columns = process_and_save_streaming(APO_DIR, HOLO_DIR, True, first_write, global_columns, processed_pdbs)
+    
+    # Step 2: Process Non-Heme proteins (Negatives)
+    first_write, global_columns = process_and_save_streaming(NON_HEME_DIR, NON_HEME_DIR, False, first_write, global_columns, processed_pdbs)
 
     if os.path.exists(OUTPUT_CSV):
         final_df = pd.read_csv(OUTPUT_CSV)
-        print(f"\n-> Successfully saved {len(final_df)} total pockets to '{OUTPUT_CSV}'.")
+        print(f"\n->  Successfully finished! {len(final_df)} total pockets are in '{OUTPUT_CSV}'.")
         if 'Target' in final_df.columns:
             print(f"-> Total True Heme-Binding Pockets (Target=1): {final_df['Target'].sum()}")

@@ -39,7 +39,7 @@ query = {
     },
     "return_type": "entry",
     "request_options": {
-        "paginate": {"start": 801, "rows": 10000}
+        "paginate": {"start": 0, "rows": 10000}
     }
 }
 
