@@ -84,6 +84,14 @@ class DockingRequest(BaseModel):
 
 # --- ENDPOINTS ---
 
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "active",
+        "message": "HemeDiscover API is running"
+    }
+
+
 @app.post("/predict_heme_binding")
 async def predict_binding(
     background_tasks: BackgroundTasks,
